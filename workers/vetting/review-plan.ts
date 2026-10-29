@@ -35,9 +35,12 @@ export const DEFAULT_BATCH_TOKENS = 150_000;
 export const BYTES_PER_TOKEN = 3;
 /** Fixed per-item JSON framing, counted like the single-call envelope. */
 const ITEM_OVERHEAD_BYTES = 160;
+/** Batch metadata, `sameBytesAs` framing and JSON punctuation. */
+const BATCH_OVERHEAD_BYTES = 2_048;
 const MAX_BUNDLE_GAPS = 100;
 
 type Item = { id: string; text: string; sha256: string };
+type PlannedItem = { item: Item; aliases: string[] };
 type Inventory = {
   items: Item[];
   artifacts: unknown[];
@@ -57,6 +60,12 @@ export type ReviewPlan =
 /** Serialized size, so escaping counts against the budget. */
 const itemBytes = (item: Item) =>
   Buffer.byteLength(JSON.stringify(item)) + ITEM_OVERHEAD_BYTES;
+const aliasBytes = (id: string, aliases: string[]) =>
+  aliases.length === 0
+    ? 0
+    : Buffer.byteLength(JSON.stringify({ [id]: aliases }));
+const plannedItemBytes = ({ item, aliases }: PlannedItem) =>
+  itemBytes(item) + aliasBytes(item.id, aliases);
 const tokens = (bytes: number) => Math.ceil(bytes / BYTES_PER_TOKEN);
 /** A larger input gets more time; an outage still fails as a retry. */
 export const callTimeoutMs = (estimatedTokens: number) =>
@@ -154,25 +163,54 @@ export function planReview(
     .sort((a, b) => a.tier - b.tier || a.position - b.position)
     .map((entry) => entry.item);
   const limit = Math.min(batchTokens * BYTES_PER_TOKEN, MAX_INVENTORY_BYTES);
-  const groups: Item[][] = [];
-  let current: Item[] = [];
-  let bytes = 0;
-  for (const item of ordered) {
-    const size = itemBytes(item);
+  const aliasGroups = (item: Item, aliases: string[]): PlannedItem[] => {
+    if (aliases.length === 0) return [{ item, aliases: [] }];
+    const groups: PlannedItem[] = [];
+    let current: string[] = [];
+    for (const alias of aliases) {
+      const candidate: PlannedItem = {
+        item,
+        aliases: [...current, alias],
+      };
+      if (
+        current.length > 0 &&
+        BATCH_OVERHEAD_BYTES + plannedItemBytes(candidate) > limit
+      ) {
+        groups.push({ item, aliases: current });
+        current = [alias];
+      } else current.push(alias);
+    }
+    if (current.length > 0) groups.push({ item, aliases: current });
+    return groups;
+  };
+  const plannedItems = ordered.flatMap((item) =>
+    aliasGroups(item, sameBytes.get(item.id) ?? []),
+  );
+  const groups: PlannedItem[][] = [];
+  let current: PlannedItem[] = [];
+  let bytes = BATCH_OVERHEAD_BYTES;
+  for (const plannedItem of plannedItems) {
+    const size = plannedItemBytes(plannedItem);
+    const repeatedContent = current.some(
+      ({ item }) => item.sha256 === plannedItem.item.sha256,
+    );
     if (
       current.length > 0 &&
-      (bytes + size > limit || current.length >= MAX_INVENTORY_ITEMS)
+      (bytes + size > limit ||
+        current.length >= MAX_INVENTORY_ITEMS ||
+        repeatedContent)
     ) {
       groups.push(current);
       current = [];
-      bytes = 0;
+      bytes = BATCH_OVERHEAD_BYTES;
     }
-    current.push(item);
+    current.push(plannedItem);
     bytes += size;
   }
   if (current.length > 0) groups.push(current);
-  const batches = groups.map((items, index) =>
-    planned(
+  const batches = groups.map((plannedItems, index) => {
+    const items = plannedItems.map(({ item }) => item);
+    return planned(
       JSON.stringify({
         schemaVersion: INVENTORY_SCHEMA,
         batch: {
@@ -182,12 +220,12 @@ export function planReview(
           note: "One batch of a repository review; coverage refers to the supplied items. A repository-level synthesis follows.",
         },
         items,
-        ...(items.some((item) => sameBytes.has(item.id))
+        ...(plannedItems.some(({ aliases }) => aliases.length > 0)
           ? {
               sameBytesAs: Object.fromEntries(
-                items
-                  .filter((item) => sameBytes.has(item.id))
-                  .map((item) => [item.id, sameBytes.get(item.id)]),
+                plannedItems
+                  .filter(({ aliases }) => aliases.length > 0)
+                  .map(({ item, aliases }) => [item.id, aliases]),
               ),
             }
           : {}),
@@ -195,8 +233,8 @@ export function planReview(
         visibilityGaps: [],
       }),
       items.length,
-    ),
-  );
+    );
+  });
   return { mode: "batched", batches, batchTokens };
 }
 

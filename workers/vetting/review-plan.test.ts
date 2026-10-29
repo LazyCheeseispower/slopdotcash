@@ -151,6 +151,31 @@ test("a large inventory is split into budgeted batches, risky first, with nothin
   expect(planReview(inspection)).toEqual(plan);
 });
 
+test("many byte-identical paths stay within the batch budget", () => {
+  const files = Array.from({ length: 1024 }, (_, index) =>
+    file(
+      `generated/${"x".repeat(900)}-${index}.ts`,
+      "export const shared = true;\n",
+    ),
+  );
+  const inspection = inspectRepository({ files });
+  const plan = planReview(inspection);
+  if (plan.mode !== "batched") throw new Error("Expected batches");
+  expect(plan.batches.length).toBeGreaterThan(1);
+  const aliases = plan.batches.flatMap((batch) => {
+    const value = JSON.parse(batch.evidence) as {
+      sameBytesAs?: Record<string, string[]>;
+    };
+    return Object.values(value.sameBytesAs ?? {}).flat();
+  });
+  expect(aliases).toHaveLength(files.length - 1);
+  expect(new Set(aliases).size).toBe(files.length - 1);
+  for (const batch of plan.batches)
+    expect(Buffer.byteLength(batch.evidence)).toBeLessThanOrEqual(
+      plan.batchTokens * BYTES_PER_TOKEN,
+    );
+});
+
 /** A provider that records each request and answers per call. */
 function provider(answer: (input: string, index: number) => Response | null) {
   const calls: string[] = [];
